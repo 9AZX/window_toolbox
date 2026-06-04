@@ -4,7 +4,10 @@ import 'dart:ffi' as ffi;
 
 import 'package:win32/win32.dart';
 import 'package:ffi/ffi.dart' as ffi;
-import 'win32_util.dart';
+import 'custom_window.dart' show WindowEdge;
+import 'win32_util.dart' hide GetDpiForWindow;
+
+export 'custom_window.dart' show WindowEdge;
 
 /// Provides additional delegate methods for [WindowControllerWin32].
 ///
@@ -18,9 +21,30 @@ abstract mixin class WindowDelegateWin32 {
   /// Called during window resizing. Implementation can override target size
   /// to enforce specific aspect ratio or other constraints.
   ///
-  /// The size is provided in physical pixels.
+  /// The size is provided in physical pixels and is the size of the entire
+  /// window frame, including the non-client area.
+  ///
+  /// During interactive resizing the returned size is clamped to the window
+  /// min / max tracking size (as reported by WM_GETMINMAXINFO). Returning a
+  /// size outside of those bounds would otherwise make the system re-apply
+  /// the constraint anchored at top-left, moving the window while the user
+  /// drags the top edge or corners.
   Size? windowWillResizeToSize(Size newSize) {
     return null;
+  }
+
+  /// Called during interactive window resizing with the [edge] currently
+  /// being dragged. Implementation can override target size to enforce
+  /// specific aspect ratio or other constraints.
+  ///
+  /// The size is provided in physical pixels and is the size of the entire
+  /// window frame, including the non-client area. The returned size is
+  /// clamped to the window min / max tracking size, see
+  /// [windowWillResizeToSize].
+  ///
+  /// The default implementation forwards to [windowWillResizeToSize].
+  Size? windowWillResizeToSizeWithEdge(Size newSize, WindowEdge edge) {
+    return windowWillResizeToSize(newSize);
   }
 
   /// Called when user starts resizing or moving the window.
@@ -86,6 +110,12 @@ extension WindowControllerWin32Extension on WindowControllerWin32 {
       SWP_NOMOVE | SWP_NOACTIVATE,
     );
     ffi.malloc.free(rect);
+  }
+
+  /// Returns the DPI scale of the window (1.0 means 96 DPI). This is the
+  /// factor between logical and physical pixels.
+  double get dpiScale {
+    return GetDpiForWindow(HWND(windowHandle)) / 96.0;
   }
 
   /// Controls whether the window can be minimized. This disables or enables the
@@ -160,6 +190,52 @@ extension WindowControllerWin32Extension on WindowControllerWin32 {
 // Implementation details.
 //
 
+WindowEdge? _windowEdgeFromSizingWParam(int wParam) {
+  return switch (wParam) {
+    WMSZ_LEFT => WindowEdge.west,
+    WMSZ_RIGHT => WindowEdge.east,
+    WMSZ_TOP => WindowEdge.north,
+    WMSZ_TOPLEFT => WindowEdge.northWest,
+    WMSZ_TOPRIGHT => WindowEdge.northEast,
+    WMSZ_BOTTOM => WindowEdge.south,
+    WMSZ_BOTTOMLEFT => WindowEdge.southWest,
+    WMSZ_BOTTOMRIGHT => WindowEdge.southEast,
+    _ => null,
+  };
+}
+
+/// Min / max tracking size of a window (physical pixels, full window frame).
+typedef _TrackSize = ({Size min, Size max});
+
+/// Queries the min / max tracking size of the window through
+/// WM_GETMINMAXINFO, pre-filled with the same system defaults that
+/// DefWindowProc uses.
+_TrackSize _queryTrackSize(HWND windowHandle) {
+  final minMaxInfo = ffi.malloc<MINMAXINFO>();
+  minMaxInfo.ref.ptMinTrackSize.x = GetSystemMetrics(SM_CXMINTRACK);
+  minMaxInfo.ref.ptMinTrackSize.y = GetSystemMetrics(SM_CYMINTRACK);
+  minMaxInfo.ref.ptMaxTrackSize.x = GetSystemMetrics(SM_CXMAXTRACK);
+  minMaxInfo.ref.ptMaxTrackSize.y = GetSystemMetrics(SM_CYMAXTRACK);
+  SendMessage(
+    windowHandle,
+    WM_GETMINMAXINFO,
+    WPARAM(0),
+    LPARAM(minMaxInfo.address),
+  );
+  final result = (
+    min: Size(
+      minMaxInfo.ref.ptMinTrackSize.x.toDouble(),
+      minMaxInfo.ref.ptMinTrackSize.y.toDouble(),
+    ),
+    max: Size(
+      minMaxInfo.ref.ptMaxTrackSize.x.toDouble(),
+      minMaxInfo.ref.ptMaxTrackSize.y.toDouble(),
+    ),
+  );
+  ffi.malloc.free(minMaxInfo);
+  return result;
+}
+
 final _subclassState = <int, _WindowControllerWin32Private>{};
 
 int _subclassProc(
@@ -202,6 +278,11 @@ class _WindowControllerWin32Private {
 
   bool _inResizeMove = false;
 
+  /// Min / max tracking size cached for the duration of an interactive
+  /// resize. Invalidated when the resize ends or the DPI changes mid-drag
+  /// (window dragged across monitors).
+  _TrackSize? _trackSize;
+
   int? handleWindowsMessage(
     HWND windowHandle,
     int message,
@@ -226,11 +307,25 @@ class _WindowControllerWin32Private {
         (rect.ref.right - rect.ref.left).toDouble(),
         (rect.ref.bottom - rect.ref.top).toDouble(),
       );
+      final edge = _windowEdgeFromSizingWParam(wParam);
       Size? modifiedSize;
       for (final delegate in delegates) {
-        modifiedSize ??= delegate.windowWillResizeToSize(newSize);
+        modifiedSize ??= edge != null
+            ? delegate.windowWillResizeToSizeWithEdge(newSize, edge)
+            : delegate.windowWillResizeToSize(newSize);
       }
       if (modifiedSize != null) {
+        // Clamp to the window min / max tracking size, otherwise the system
+        // will re-apply the constraint after WM_SIZING anchored at top-left,
+        // which makes the window drift when resizing from the top edge.
+        final trackSize = _trackSize ??= _queryTrackSize(windowHandle);
+        modifiedSize = Size(
+          modifiedSize.width.clamp(trackSize.min.width, trackSize.max.width),
+          modifiedSize.height.clamp(
+            trackSize.min.height,
+            trackSize.max.height,
+          ),
+        );
         switch (wParam) {
           case WMSZ_TOP:
             rect.ref.top = rect.ref.bottom - modifiedSize.height.round();
@@ -312,9 +407,14 @@ class _WindowControllerWin32Private {
     }
     if (message == WM_EXITSIZEMOVE) {
       _inResizeMove = false;
+      _trackSize = null;
       for (final delegate in delegates) {
         delegate.exitSizeMove();
       }
+      return null;
+    }
+    if (message == WM_DPICHANGED) {
+      _trackSize = null;
       return null;
     }
     return null;

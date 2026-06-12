@@ -11,6 +11,23 @@ import 'dart:ffi' hide Size;
 import 'win32_util.dart';
 import 'widgets.dart' show WindowTrafficLightInactiveConfigration;
 
+// Windows 11 is build 22000+. The only version-specific tweak: on Windows 10
+// the client rect must keep a 1px non-client strip at the top, otherwise a
+// white line shows there; on Windows 11 the top can reach the window edge.
+// Everything else (frame inset for native shadow/resize, WM_NCACTIVATE, the
+// DwmExtendFrameIntoClientArea shadow margin) is identical on both, matching
+// what production libraries like window_manager do.
+final bool _isWindows11 = () {
+  final osvi = calloc<OSVERSIONINFO>()
+    ..ref.dwOSVersionInfoSize = sizeOf<OSVERSIONINFO>();
+  try {
+    RtlGetVersion(osvi);
+    return osvi.ref.dwBuildNumber >= 22000;
+  } finally {
+    calloc.free(osvi);
+  }
+}();
+
 class SubclassState {
   bool needRearmMouseTracker = false;
 }
@@ -141,13 +158,17 @@ class CustomWindowWin32 extends CustomWindow {
           SWP_NOACTIVATE,
     );
 
-    // final margins = malloc<MARGINS>();
-    // margins.ref.cxLeftWidth = -1;
-    // margins.ref.cxRightWidth = -1;
-    // margins.ref.cyTopHeight = -1;
-    // margins.ref.cyBottomHeight = -1;
-    // DwmExtendFrameIntoClientArea(hwnd, margins);
-    // malloc.free(margins);
+    // Restore the native drop shadow. A 1px top margin is enough to re-enable
+    // it and stays hidden behind opaque content. A negative ("sheet of
+    // glass") margin must NOT be used: it bleeds the glass into the client
+    // and causes artifacts. Works on both Windows 10 and 11.
+    final margins = malloc<MARGINS>();
+    margins.ref.cxLeftWidth = 0;
+    margins.ref.cxRightWidth = 0;
+    margins.ref.cyTopHeight = 1;
+    margins.ref.cyBottomHeight = 0;
+    DwmExtendFrameIntoClientArea(hwnd, margins);
+    malloc.free(margins);
   }
 
   final _dragExcludeRects = <BuildContext, Rect>{};
@@ -209,28 +230,36 @@ class CustomWindowWin32 extends CustomWindow {
         // This would cause Flutter relayout with a very small size.
         if (wParam == SIZE_MINIMIZED) return 0;
         break;
+      case WM_NCACTIVATE:
+        // Don't let the default handling draw the (legacy) caption over the
+        // client area when activation changes. Returning 1 keeps the window
+        // looking active without painting a title bar.
+        return 1;
       case WM_NCCALCSIZE:
-        if (wParam == 1) {
-          final dpi = _getDpiForWindow(windowHandle.cast());
-          int padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi).value;
-          int borderLR =
-              GetSystemMetricsForDpi(SM_CXFRAME, dpi).value + padding;
-          int borderTB =
-              GetSystemMetricsForDpi(SM_CYFRAME, dpi).value + padding;
-          final params = Pointer<NCCALCSIZE_PARAMS>.fromAddress(lParam);
-          final rect = params.ref.rgrc[0];
-          double scale = dpi / 96.0;
-          if (IsZoomed(_hwnd)) {
-            rect.top += borderTB;
-          } else {
-            // Otherwise we miss one pixel from top.
-            rect.top += (1 * scale).round();
-          }
-          rect.left += borderLR;
-          rect.right -= borderLR;
-          rect.bottom -= borderTB;
-          return 0;
+        // Keep a real (but invisible) non-client frame: inset the client by
+        // the system frame metrics on left/right/bottom so DWM keeps drawing
+        // the native shadow and handles resizing. The title bar is removed by
+        // pulling the client to the top edge (Windows 11) or leaving a 1px
+        // strip (Windows 10, otherwise a white line shows there). When
+        // maximized, inset the top too so the offscreen frame doesn't clip
+        // content.
+        if (wParam != 1) return 0;
+        final dpi = _getDpiForWindow(windowHandle.cast());
+        final padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi).value;
+        final borderLR =
+            GetSystemMetricsForDpi(SM_CXFRAME, dpi).value + padding;
+        final borderTB =
+            GetSystemMetricsForDpi(SM_CYFRAME, dpi).value + padding;
+        final rect = Pointer<NCCALCSIZE_PARAMS>.fromAddress(lParam).ref.rgrc[0];
+        rect.left += borderLR;
+        rect.right -= borderLR;
+        rect.bottom -= borderTB;
+        if (IsZoomed(_hwnd)) {
+          rect.top += borderTB;
+        } else {
+          rect.top += _isWindows11 ? 0 : 1;
         }
+        return 0;
       case WM_NCHITTEST:
         final (xPos, yPos) = splitLParam(lParam);
         final (xClient, yClient) = screenToClient(_hwnd, xPos, yPos);
@@ -245,34 +274,38 @@ class CustomWindowWin32 extends CustomWindow {
         final height = (rect.ref.bottom - rect.ref.top) / scale;
         malloc.free(rect);
 
-        // sides and bottom are extended through WM_NCCALCSIZE
+        // Sides and bottom keep a real non-client frame (see WM_NCCALCSIZE),
+        // so the system resizes them natively; only the top edge lives in the
+        // client and needs an in-client grip. No resize when maximized.
         const edgeSize = 1;
-        const topEdgeSize = 3; // 1px from WM_NCCALCSIZE + 3px
+        const topEdgeSize = 3;
 
         if (_maximizeButtonRects.values.any((r) => r.contains(Offset(x, y)))) {
           return HTMAXBUTTON;
         }
 
-        if (y < topEdgeSize) {
-          if (x < topEdgeSize) {
-            return HTTOPLEFT;
-          } else if (x > width - topEdgeSize) {
-            return HTTOPRIGHT;
-          } else {
-            return HTTOP;
-          }
-        } else if (y > height - edgeSize) {
-          if (x < edgeSize) {
-            return HTBOTTOMLEFT;
+        if (!IsZoomed(_hwnd)) {
+          if (y < topEdgeSize) {
+            if (x < topEdgeSize) {
+              return HTTOPLEFT;
+            } else if (x > width - topEdgeSize) {
+              return HTTOPRIGHT;
+            } else {
+              return HTTOP;
+            }
+          } else if (y > height - edgeSize) {
+            if (x < edgeSize) {
+              return HTBOTTOMLEFT;
+            } else if (x > width - edgeSize) {
+              return HTBOTTOMRIGHT;
+            } else {
+              return HTBOTTOM;
+            }
+          } else if (x < edgeSize) {
+            return HTLEFT;
           } else if (x > width - edgeSize) {
-            return HTBOTTOMRIGHT;
-          } else {
-            return HTBOTTOM;
+            return HTRIGHT;
           }
-        } else if (x < edgeSize) {
-          return HTLEFT;
-        } else if (x > width - edgeSize) {
-          return HTRIGHT;
         }
 
         for (final excludeRect in _dragExcludeRects.values) {

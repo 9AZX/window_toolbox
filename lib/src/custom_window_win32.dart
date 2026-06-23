@@ -11,6 +11,13 @@ import 'dart:ffi' hide Size;
 import 'win32_util.dart';
 import 'widgets.dart' show WindowTrafficLightInactiveConfigration;
 
+// Undocumented messages the theme engine uses to draw the legacy caption /
+// frame directly, bypassing WM_NCPAINT. Suppressed on Windows 10 only, where
+// otherwise the (buggy) legacy title bar shows on basic DWM rendering (VMs,
+// RDP). Windows 11 paints the frame correctly and needs none of this.
+const _wmNCUahDrawCaption = 0x00AE;
+const _wmNCUahDrawFrame = 0x00AF;
+
 // Windows 11 is build 22000+. The only version-specific tweak: on Windows 10
 // the client rect must keep a 1px non-client strip at the top, otherwise a
 // white line shows there; on Windows 11 the top can reach the window edge.
@@ -235,6 +242,17 @@ class CustomWindowWin32 extends CustomWindow {
         // client area when activation changes. Returning 1 keeps the window
         // looking active without painting a title bar.
         return 1;
+      case WM_NCPAINT:
+        // Windows 10 only: suppress legacy caption painting (DWM still draws
+        // the frame edge and shadow). On Windows 11 the frame paints fine.
+        if (!_isWindows11) return 0;
+        break;
+      case _wmNCUahDrawCaption:
+      case _wmNCUahDrawFrame:
+        // Windows 10 only: suppress the theme engine's direct caption / frame
+        // painting that bypasses WM_NCPAINT.
+        if (!_isWindows11) return 0;
+        break;
       case WM_NCCALCSIZE:
         // Keep a real (but invisible) non-client frame: inset the client by
         // the system frame metrics on left/right/bottom so DWM keeps drawing

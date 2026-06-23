@@ -254,13 +254,14 @@ class CustomWindowWin32 extends CustomWindow {
         if (!_isWindows11) return 0;
         break;
       case WM_NCCALCSIZE:
-        // Keep a real (but invisible) non-client frame: inset the client by
-        // the system frame metrics on left/right/bottom so DWM keeps drawing
-        // the native shadow and handles resizing. The title bar is removed by
-        // pulling the client to the top edge (Windows 11) or leaving a 1px
-        // strip (Windows 10, otherwise a white line shows there). When
-        // maximized, inset the top too so the offscreen frame doesn't clip
-        // content.
+        // Windows 11: keep a real (but invisible) non-client frame by
+        // insetting the client on left/right/bottom, so DWM draws the native
+        // shadow and resizes those edges. Windows 10 would paint a visible
+        // border on that frame (the caption suppression leaves it unpainted),
+        // so the whole window becomes client area instead; the shadow is
+        // restored via DwmExtendFrameIntoClientArea and resizing via
+        // WM_NCHITTEST. When maximized, both inset so the offscreen frame
+        // doesn't clip content.
         if (wParam != 1) return 0;
         final dpi = _getDpiForWindow(windowHandle.cast());
         final padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi).value;
@@ -269,14 +270,17 @@ class CustomWindowWin32 extends CustomWindow {
         final borderTB =
             GetSystemMetricsForDpi(SM_CYFRAME, dpi).value + padding;
         final rect = Pointer<NCCALCSIZE_PARAMS>.fromAddress(lParam).ref.rgrc[0];
-        rect.left += borderLR;
-        rect.right -= borderLR;
-        rect.bottom -= borderTB;
         if (IsZoomed(_hwnd)) {
           rect.top += borderTB;
-        } else {
-          rect.top += _isWindows11 ? 0 : 1;
+          rect.left += borderLR;
+          rect.right -= borderLR;
+          rect.bottom -= borderTB;
+        } else if (_isWindows11) {
+          rect.left += borderLR;
+          rect.right -= borderLR;
+          rect.bottom -= borderTB;
         }
+        // Windows 10 windowed: rect left untouched (full client area).
         return 0;
       case WM_NCHITTEST:
         final (xPos, yPos) = splitLParam(lParam);
@@ -292,11 +296,12 @@ class CustomWindowWin32 extends CustomWindow {
         final height = (rect.ref.bottom - rect.ref.top) / scale;
         malloc.free(rect);
 
-        // Sides and bottom keep a real non-client frame (see WM_NCCALCSIZE),
-        // so the system resizes them natively; only the top edge lives in the
-        // client and needs an in-client grip. No resize when maximized.
-        const edgeSize = 1;
-        const topEdgeSize = 3;
+        // Windows 11 keeps a real frame, so the system resizes sides/bottom
+        // natively and only the top edge needs an in-client grip. Windows 10
+        // is full client area, so every edge relies on this in-client zone
+        // (~8px, the native resize border width). No resize when maximized.
+        final edgeSize = _isWindows11 ? 1 : 8;
+        final topEdgeSize = _isWindows11 ? 3 : 8;
 
         if (_maximizeButtonRects.values.any((r) => r.contains(Offset(x, y)))) {
           return HTMAXBUTTON;

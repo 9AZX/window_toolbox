@@ -86,6 +86,19 @@ external cw_rect_t cw_nswindow_get_frame(
   ffi.Pointer<ffi.Void> ns_window,
 );
 
+@ffi.Native<
+  ffi.Void Function(
+    ffi.Pointer<cw_tile_entry_t>,
+    ffi.Size,
+    ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>,
+  )
+>()
+external void cw_nswindow_tile_async(
+  ffi.Pointer<cw_tile_entry_t> entries,
+  int count,
+  ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>> on_applied,
+);
+
 final class cw_rect_t extends ffi.Struct {
   @ffi.Double()
   external double x;
@@ -183,4 +196,16 @@ final class cw_delegate_config_t extends ffi.Struct {
     ffi.NativeFunction<cw_rect_t Function(cw_rect_t default_frame)>
   >
   on_window_will_use_standard_frame;
+}
+
+final class cw_tile_entry_t extends ffi.Struct {
+  external ffi.Pointer<ffi.Void> ns_window;
+
+  @ffi.Double()
+  external double origin_x;
+
+  @ffi.Double()
+  external double origin_y;
+
+  external cw_size_t content_size;
 }

@@ -428,6 +428,48 @@ cw_rect_t cw_nswindow_get_frame(void *ns_window) {
                      frame.size.height};
 }
 
+void cw_nswindow_tile_async(const cw_tile_entry_t *entries, size_t count,
+                            void (*on_applied)(void)) {
+  if (entries == NULL || count == 0) {
+    if (on_applied != NULL) {
+      on_applied();
+    }
+    return;
+  }
+  // Box the entries so the block owns them: the caller's buffer is gone by the
+  // time the main queue drains, and holding each NSWindow strongly means a
+  // window closed in the meantime is still a valid (if unshown) receiver.
+  NSMutableArray<NSDictionary *> *requests =
+      [NSMutableArray arrayWithCapacity:count];
+  for (size_t i = 0; i < count; i++) {
+    NSWindow *window = (__bridge NSWindow *)entries[i].ns_window;
+    if (window == nil) {
+      continue;
+    }
+    [requests addObject:@{
+      @"window" : window,
+      @"frame" : [NSValue
+          valueWithRect:NSMakeRect(entries[i].origin_x, entries[i].origin_y,
+                                   entries[i].content_size.w,
+                                   entries[i].content_size.h)],
+    }];
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{
+    for (NSDictionary *request in requests) {
+      NSWindow *window = request[@"window"];
+      NSRect frame = [request[@"frame"] rectValue];
+      // Content size first, then origin: AppKit pins the top-left corner while
+      // resizing, which shifts the bottom-left frame origin we are about to
+      // set.
+      [window setContentSize:frame.size];
+      [window setFrameOrigin:frame.origin];
+    }
+    if (on_applied != NULL) {
+      on_applied();
+    }
+  });
+}
+
 @implementation CWDefaultWindowDelegate
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {

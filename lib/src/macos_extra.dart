@@ -1,8 +1,10 @@
 import 'package:flutter/src/widgets/_window_macos.dart';
 import 'package:flutter/src/widgets/_window.dart';
-import 'dart:ui' show Size, Rect;
+import 'dart:ui' show Offset, Size, Rect;
 
 import 'dart:ffi' as ffi;
+
+import 'package:ffi/ffi.dart';
 
 import 'macos.g.dart';
 
@@ -156,6 +158,76 @@ extension WindowControllerMacOSExtension on WindowControllerMacOS {
     cwRect.w = frame.width;
     cwRect.h = frame.height;
     cw_nswindow_set_frame(windowHandle, cwRect);
+  }
+}
+
+/// One window placement for [tileWindowsMacOS]: the window to place, the
+/// content size it should adopt and the frame origin it should end up at.
+///
+/// Unlike [WindowControllerMacOSExtension.setWindowFrame], `origin` is in
+/// AppKit screen coordinates — y grows upwards from the bottom of the primary
+/// display.
+class MacOSWindowPlacement {
+  final Size contentSize;
+  final WindowControllerMacOS controller;
+  final Offset origin;
+
+  const MacOSWindowPlacement({
+    required this.contentSize,
+    required this.controller,
+    required this.origin,
+  });
+}
+
+/// Resizes and repositions several windows at once, on the next turn of the
+/// main run loop rather than during this call.
+///
+/// Deferring is what makes this usable at all. Resizing a window makes
+/// Flutter's resize synchronizer spin on the platform thread until the raster
+/// thread presents a frame at the new size; on macOS the platform and UI
+/// threads are merged, so a resize issued from Dart blocks the very thread
+/// that owes it that frame. Such a resize can only end in the synchronizer's
+/// one-second timeout, logging `Resize timed out`, once per window. Because
+/// the placements here are applied from a main queue block with no Dart frame
+/// on the stack, the synchronizer's message pump can drive the frame pipeline
+/// and each resize commits in one frame.
+///
+/// In exchange, the new geometry is not observable when this returns.
+/// [onApplied] is invoked once every window has been placed. Callers that watch
+/// windows for user-driven moves should arm those watchers from there: a
+/// programmatic move posts `NSWindowDidMoveNotification` like any other, so a
+/// watcher armed earlier cannot tell this placement from the user's.
+void tileWindowsMacOS(
+  List<MacOSWindowPlacement> placements, {
+  required void Function() onApplied,
+}) {
+  if (placements.isEmpty) {
+    onApplied();
+    return;
+  }
+  late final ffi.NativeCallable<ffi.Void Function()> callback;
+  callback = ffi.NativeCallable<ffi.Void Function()>.listener(() {
+    callback.close();
+    onApplied();
+  });
+  final entries = calloc<cw_tile_entry_t>(placements.length);
+  try {
+    for (var i = 0; i < placements.length; i++) {
+      final placement = placements[i];
+      entries[i]
+        ..ns_window = placement.controller.windowHandle
+        ..origin_x = placement.origin.dx
+        ..origin_y = placement.origin.dy
+        ..content_size.w = placement.contentSize.width
+        ..content_size.h = placement.contentSize.height;
+    }
+    cw_nswindow_tile_async(
+      entries,
+      placements.length,
+      callback.nativeFunction,
+    );
+  } finally {
+    calloc.free(entries);
   }
 }
 

@@ -84,6 +84,36 @@ EXPORT void cw_nswindow_init_delegate(void *ns_window,
 EXPORT void cw_nswindow_set_frame(void *ns_window, cw_rect_t frame);
 EXPORT cw_rect_t cw_nswindow_get_frame(void *ns_window);
 
+typedef struct {
+  void *ns_window;
+  double origin_x;
+  double origin_y;
+  cw_size_t content_size;
+} cw_tile_entry_t;
+
+// Resizes each window's content area to `content_size` and moves its frame
+// origin to (`origin_x`, `origin_y`), on the main queue, after the current
+// call stack has unwound.
+//
+// The deferral is mandatory, not an optimisation. `-[NSWindow setContentSize:]`
+// makes Flutter's resize synchronizer spin on the platform thread until the
+// raster thread presents a frame at the new size. On macOS the platform and UI
+// threads are merged, so a resize issued from Dart blocks the very thread that
+// has to produce that frame: the wait can only end in its 1-second timeout
+// ("Resize timed out"), once per window. Running the same calls from a main
+// queue block leaves no Dart frame on the stack, so the synchronizer's message
+// pump can drive the frame pipeline and the resize commits in one frame.
+//
+// `entries` is copied, so the caller may free it as soon as this returns.
+//
+// `on_applied` runs at the end of that same block, once every window has its
+// new geometry. It may be NULL. Callers that watch windows for user-driven
+// moves should arm those watchers from here: `-[NSWindow setFrameOrigin:]`
+// posts `NSWindowDidMoveNotification` like any other move, so a watcher armed
+// before this point cannot tell our placement from the user's.
+EXPORT void cw_nswindow_tile_async(const cw_tile_entry_t *entries, size_t count,
+                                   void (*on_applied)(void));
+
 #ifdef __cplusplus
 }
 #endif

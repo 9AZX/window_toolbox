@@ -226,28 +226,31 @@ static bool IsRTL() {
       _inactiveView.right.opacity = 0;
     } else {
       left.superview.alphaValue = 0;
-      _inactiveView.left.opacity = 1;
-      _inactiveView.middle.opacity = 1;
-      _inactiveView.right.opacity = 1;
+      // A hidden button gets no inactive replica: a window that hides some of
+      // its traffic lights (e.g. close-only) must not resurrect them while
+      // inactive.
+      _inactiveView.left.opacity = left.hidden ? 0 : 1;
+      _inactiveView.middle.opacity = middle.hidden ? 0 : 1;
+      _inactiveView.right.opacity = right.hidden ? 0 : 1;
     }
 
     // Note: Setting alpha to exactly 0 will cause the button never be reenabled
     // after updating window styleMask.
     if (!left.enabled) {
       left.alphaValue = 0.001;
-      _inactiveView.left.opacity = 1;
+      _inactiveView.left.opacity = left.hidden ? 0 : 1;
     } else {
       left.alphaValue = 1;
     }
     if (!middle.enabled) {
       middle.alphaValue = 0.001;
-      _inactiveView.middle.opacity = 1;
+      _inactiveView.middle.opacity = middle.hidden ? 0 : 1;
     } else {
       middle.alphaValue = 1;
     }
     if (!right.enabled) {
       right.alphaValue = 0.001;
-      _inactiveView.right.opacity = 1;
+      _inactiveView.right.opacity = right.hidden ? 0 : 1;
     } else {
       right.alphaValue = 1;
     }
